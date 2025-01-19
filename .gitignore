@@ -1,0 +1,5 @@
+.env.local
+venv/
+.DS_Store
+.venv/
+outbound-trunk.json
