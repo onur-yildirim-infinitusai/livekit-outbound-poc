@@ -39,3 +39,15 @@ prerequisite:
   https://docs.livekit.io/agents/openai/customize/turn-detection/
   https://platform.openai.com/docs/guides/realtime-model-capabilities
 
+
+  Running using cloud:
+
+  python3 agent.py start
+
+
+  lk dispatch create \
+    --new-room \
+    --agent-name outbound-caller \
+    --metadata '<your phone number>' \
+    --api-key APIAAjQyPwbMa6v --api-secret kIfF3uGsGwZr7P4lIk7QPHcElUHeqafBhk7abYDHHRaA --url wss://outbound-poc-6amhti9g.livekit.cloud
+
