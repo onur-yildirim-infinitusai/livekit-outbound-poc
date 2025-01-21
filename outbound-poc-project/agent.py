@@ -87,7 +87,7 @@ HIPAA_SECTION = {
     - This should be the first section of the questionnaire.
     - You get two attempts to verify their date of birth
     - If they fail both attempts, you must gracefully exit the call
-    - If they pass authentication after verifying their date of birth, proceed to HEALTH_ASSESSMENT_SECTION
+    - If they answer correctly, proceed to HEALTH_ASSESSMENT_SECTION
     - For each HIPAA question:
      - Ask the question clearly
         - If they don't answer, do one pushback
@@ -116,7 +116,7 @@ HEALTH_ASSESSMENT_SECTION = {
 }
 
 USER_INFO = {
-    "first_name": "Jayden",
+    "first_name": "Adam",
     "last_name": "Smith",
     "dob": "1992-01-01",
 }
