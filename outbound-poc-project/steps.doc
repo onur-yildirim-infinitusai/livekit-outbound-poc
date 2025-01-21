@@ -25,3 +25,17 @@ lk dispatch create \
   In trial you can only call the verified numbers (your number and registered numbers)
   https://www.twilio.com/docs/api/errors/32100
 
+
+Running using cloud:
+
+python3 agent.py start
+
+
+lk dispatch create \
+  --new-room \
+  --agent-name outbound-caller \
+  --metadata '<your phone number>' \
+  --api-key APIAAjQyPwbMa6v --api-secret kIfF3uGsGwZr7P4lIk7QPHcElUHeqafBhk7abYDHHRaA --url wss://outbound-poc-6amhti9g.livekit.cloud
+
+
+
