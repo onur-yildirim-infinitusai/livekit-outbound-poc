@@ -15,6 +15,7 @@ from livekit.agents import (
     WorkerOptions,
     cli,
     llm,
+    metrics
 )
 from livekit.agents.multimodal import MultimodalAgent
 from livekit.agents.pipeline import VoicePipelineAgent
@@ -27,11 +28,123 @@ logger = logging.getLogger("outbound-caller")
 logger.setLevel(logging.INFO)
 
 outbound_trunk_id = os.getenv("SIP_OUTBOUND_TRUNK_ID")
+# _default_instructions = (
+#     "You are a scheduling assistant for a dental practice. Your interface with user will be voice."
+#     "You will be on a call with a patient who has an upcoming appointment. Your goal is to confirm the appointment details."
+#     "As a customer service representative, you will be polite and professional at all times. Allow user to end the conversation."
+# )
+
+SYSTEM_PROMPT = """
+ {default_instructions}
+
+ User Information:
+ {user_info}
+
+ Sections in the questionnaire:
+ {sections}
+
+"""
 _default_instructions = (
-    "You are a scheduling assistant for a dental practice. Your interface with user will be voice."
-    "You will be on a call with a patient who has an upcoming appointment. Your goal is to confirm the appointment details."
-    "As a customer service representative, you will be polite and professional at all times. Allow user to end the conversation."
+   "You are an expert care coordinator, calling on behalf of a healthcare company called 'Zing Health' that is calling a patient to do a health risk assessment."
+   "Your interface with user will be voice."
+   "Your goal is to follow the rules in the sections of the questionnaire provided below and use the correct utterances provided for the actions."
+   "Rules:"
+   "- Confirm that your response is on the list of allowed responses before you respond with it."
+   "- Always interact with the patient with respect, professional courtesy and empathy."
+   "- If there is no relevant clarification question, you may repeat your previous request/answer to the agent by responding with 'RepeatPreviousAction' action."
+   "- If the patient asks you to repeat yourself or to repeat your most recent question, you should respond with 'RepeatPreviousAction' action."
+#    "- In some cases, if the patient either doesn't know the answer to your question or is unable to look up the information you have requested, it is safe to continue to the next appropriate question."
+   "- You have to use one of the allowed actions in your response for the section of the questionnaire you are currently on."
 )
+
+GREETING_SECTION = {
+    "section_name": "GREETING_SECTION",
+    "allowed_actions": [
+        {"action": "HRAAskToSpeakToMember", "utterance": "Hi good morning, may I speak to <user_info.first_name> please?"},
+        {"action": "HRAGiveGreeting", "utterance": "Hi there! This is Eva and I'm a digital assistant calling from Zing Health, your Medicare plan. I'm calling to ask a few health related questions to ensure you can get the most out of your plan with supplemental benefits, as well as the care you need. Do you by chance have a few minutes right now to go over those questions with me?"},
+        {"action": "CallbackLater", "utterance": "I will call you back later. Goodbye!"},
+        {"action": "EndCall", "utterance": "Sorry for bothering you. Goodbye!"},
+    ],
+    "instructions":
+    """
+    - Greet the patient with a friendly and professional tone.
+    - If the patient is not the right person, hangup the call.
+    - If they are not available right now, tell them you will call them back later and hangup the call.
+    - If the patient is the right person, proceed to the next section.
+    """
+}
+
+HIPAA_SECTION = {
+    "section_name": "HIPAA_SECTION",
+    "allowed_actions": [
+        {"action": "HRAConfirmDOB", "utterance": "Ok great, thanks. Your account security is very important to us. Can you please confirm your date of birth?"},
+        {"action": "RetryPatientDOB", "utterance": "Sorry can you please repeat your answer?"},
+        {"action": "ThankYou", "utterance": "Thank you for your response. It's matched with our records."},
+        {"action": "EndCall", "utterance": "Date of birth is not matched with our records. We will call you back later."},
+    ],
+    "instructions":
+    """
+    - This should be the first section of the questionnaire.
+    - You get two attempts to verify their date of birth
+    - If they fail both attempts, you must gracefully exit the call
+    - If they pass authentication after verifying their date of birth, proceed to HEALTH_ASSESSMENT_SECTION
+    - For each HIPAA question:
+     - Ask the question clearly
+        - If they don't answer, do one pushback
+        - If they still don't answer after pushback, gracefully exit
+        - If the answer is not valid after pushback, gracefully exit
+        - If the answer is valid, proceed to the next section
+    """
+}
+HEALTH_ASSESSMENT_SECTION = {
+    "section_name": "HEALTH_ASSESSMENT_SECTION",
+    "allowed_actions": [
+        {"action": "HRAIntroMedicalSection", "utterance": "Thank you! This should take less than 10 minutes. And just so you know, I'm an automated system and your call may be recorded for quality and training purposes. First, I'm going to list some medical conditions, and can you please let me know if you've been diagnosed with any of them?"},
+        {"action": "HRAAskBehavioralHealthIssues", "utterance": "Have you been diagnosed with any behavioral health issues such as depression or anxiety?"},
+        {"action": "WhichOneSpesifically", "utterance": "Which one specifically?"},
+        {"action": "EndCall", "utterance": "Thank you for your responses. Goodbye!"},
+    ],
+    "instructions":
+    """
+    - For each health assessment question:
+     - Ask the question clearly
+        - If they don't answer, do one pushback by asking the same action again.
+        - If they do answer, capture their response and move to next question.
+        - If they still don't answer after pushback, move to next question.
+        - If all the questions are asked, hangup the call.
+    """
+}
+
+USER_INFO = {
+    "first_name": "Jayden",
+    "last_name": "Smith",
+    "dob": "1992-01-01",
+}
+
+def build_prompt(default_instructions: str, user_info: dict[str, str], sections: list[dict]) -> str:
+    sections_prompt = ""
+    for section in sections:
+        actions_prompt = ""
+        for action in section['allowed_actions']:
+            actions_prompt += f"""
+            {action['action']}: {action['utterance']}
+            """
+        sections_prompt += f"""
+        {section['section_name']}: 
+        {section['instructions']}
+        Allowed actions and utterances -- you can only use one of the following actions in your response::
+        {actions_prompt}
+        """
+    user_info_prompt = ""
+    for key, value in user_info.items():
+        user_info_prompt += f"{key}: {value}\n"
+
+    return SYSTEM_PROMPT.format(
+        default_instructions=default_instructions,
+        user_info=user_info_prompt,
+        sections=sections_prompt
+    )
+
 
 
 async def entrypoint(ctx: JobContext):
@@ -45,10 +158,19 @@ async def entrypoint(ctx: JobContext):
     logger.info(f"dialing {phone_number} to room {ctx.room.name}")
 
     # look up the user's phone number and appointment details
-    instructions = (
-        _default_instructions
-        + "The customer's name is Jayden. His appointment is next Tuesday at 3pm."
+
+    #Build sections prompt
+    sections = [GREETING_SECTION, HIPAA_SECTION, HEALTH_ASSESSMENT_SECTION]
+    instructions = build_prompt(
+        default_instructions=_default_instructions,
+        user_info=USER_INFO,
+        sections=sections
     )
+
+    # instructions = (
+    #     _default_instructions
+    #     + "The customer's name is Jayden. His appointment is next Tuesday at 3pm."
+    # )
 
     # `create_sip_participant` starts dialing the user
     await ctx.api.sip.create_sip_participant(
@@ -97,14 +219,14 @@ class CallActions(llm.FunctionContext):
     """
 
     def __init__(
-        self, *, api: api.LiveKitAPI, participant: rtc.RemoteParticipant, room: rtc.Room
+        self, *, api: api.LiveKitAPI, participant: rtc.RemoteParticipant, room: rtc.Room, patient_info: dict[str, str]
     ):
         super().__init__()
 
         self.api = api
         self.participant = participant
         self.room = room
-
+        self.patient_info = patient_info
     async def hangup(self):
         try:
             await self.api.room.remove_participant(
@@ -123,34 +245,56 @@ class CallActions(llm.FunctionContext):
         logger.info(f"ending the call for {self.participant.identity}")
         await self.hangup()
 
-    @llm.ai_callable()
-    async def look_up_availability(
-        self,
-        date: Annotated[str, "The date of the appointment to check availability for"],
-    ):
-        """Called when the user asks about alternative appointment availability"""
-        logger.info(
-            f"looking up availability for {self.participant.identity} on {date}"
-        )
-        asyncio.sleep(3)
-        return json.dumps(
-            {
-                "available_times": ["1pm", "2pm", "3pm"],
-            }
-        )
+    # @llm.ai_callable()
+    # async def look_up_availability(
+    #     self,
+    #     date: Annotated[str, "The date of the appointment to check availability for"],
+    # ):
+    #     """Called when the user asks about alternative appointment availability"""
+    #     logger.info(
+    #         f"looking up availability for {self.participant.identity} on {date}"
+    #     )
+    #     asyncio.sleep(3)
+    #     return json.dumps(
+    #         {
+    #             "available_times": ["1pm", "2pm", "3pm"],
+    #         }
+    #     )
+
+    # @llm.ai_callable()
+    # async def confirm_appointment(
+    #     self,
+    #     date: Annotated[str, "date of the appointment"],
+    #     time: Annotated[str, "time of the appointment"],
+    # ):
+    #     """Called when the user confirms their appointment on a specific date. Use this tool only when they are certain about the date and time."""
+    #     logger.info(
+    #         f"confirming appointment for {self.participant.identity} on {date} at {time}"
+    #     )
+    #     return "reservation confirmed"
 
     @llm.ai_callable()
-    async def confirm_appointment(
-        self,
-        date: Annotated[str, "date of the appointment"],
-        time: Annotated[str, "time of the appointment"],
-    ):
-        """Called when the user confirms their appointment on a specific date. Use this tool only when they are certain about the date and time."""
-        logger.info(
-            f"confirming appointment for {self.participant.identity} on {date} at {time}"
-        )
-        return "reservation confirmed"
-
+    async def look_up_patient_name(self,
+                                   name: Annotated[str, "The name of the patient"]):
+        """Called when the user answers the HRAAskToSpeakToMember question"""
+        logger.info(f"asking if we are talking to the right person for {self.participant.identity} with value {name}")
+        return name == self.patient_info["first_name"]
+    
+    @llm.ai_callable()
+    async def look_up_patient_dob(self,
+                                  dob: Annotated[str, "The date of birth to look up and format is YYYY-MM-DD"]):
+        """Called when the user provides a date of birth"""
+        logger.info(f"looking up patient's date of birth for {self.participant.identity} with value {dob}")
+        return dob == self.patient_info["dob"]
+    
+    @llm.ai_callable()
+    async def evaluate_patient_behavioral_health_answer(self,
+                                  behavioral_health: Annotated[str, "The behavioral health answer to check whether the patient has been diagnosed with any behavioral health issues such as depression or anxiety"]):
+        """Called when the user provides a behavioral health answer"""
+        logger.info(f"looking up patient's answer for behavioral health for {self.participant.identity} with value {behavioral_health}")
+        return behavioral_health.lower() in ["depression", "anxiety"]
+    
+    
     @llm.ai_callable()
     async def detected_answering_machine(self):
         """Called when the call reaches voicemail. Use this tool AFTER you hear the voicemail greeting"""
@@ -174,7 +318,7 @@ def run_voice_pipeline_agent(
         llm=openai.LLM(),
         tts=openai.TTS(),
         chat_ctx=initial_ctx,
-        fnc_ctx=CallActions(api=ctx.api, participant=participant, room=ctx.room),
+        fnc_ctx=CallActions(api=ctx.api, participant=participant, room=ctx.room, patient_info=USER_INFO),
     )
 
     agent.start(ctx.room, participant)
@@ -185,14 +329,58 @@ def run_multimodal_agent(
 ):
     logger.info("starting multimodal agent")
 
+    # https://docs.livekit.io/agents/openai/customize/parameters/
     model = openai.realtime.RealtimeModel(
         instructions=instructions,
         modalities=["audio", "text"],
     )
+    # chat_ctx = llm.ChatContext()
     agent = MultimodalAgent(
         model=model,
-        fnc_ctx=CallActions(api=ctx.api, participant=participant, room=ctx.room),
+        fnc_ctx=CallActions(api=ctx.api, participant=participant, room=ctx.room, patient_info=USER_INFO),
+        # chat_ctx=chat_ctx,
     )
+
+    @agent.on("user_started_speaking")
+    def user_started_speaking():
+        print("user_started_speaking")
+
+    @agent.on("user_stopped_speaking")
+    def user_stopped_speaking():
+        print("user_stopped_speaking")
+
+    @agent.on("agent_started_speaking")
+    def agent_started_speaking():
+        print("agent_started_speaking")
+
+    @agent.on("agent_stopped_speaking")
+    def agent_stopped_speaking():
+        print("agent_stopped_speaking")
+
+    @agent.on("user_speech_committed")
+    def user_speech_committed(msg: llm.ChatMessage):
+        print(f"user_speech_committed: {msg}")
+
+    @agent.on("agent_speech_committed")
+    def agent_speech_committed(msg: llm.ChatMessage):
+        print(f"agent_speech_committed: {msg}")
+
+    @agent.on("agent_speech_interrupted")
+    def agent_speech_interrupted():
+        print("agent_speech_interrupted")
+
+    @agent.on("function_calls_collected")
+    def function_calls_collected(fnc_call_infos: list[llm.FunctionCallInfo]):
+        print(f"function_calls_collected: {fnc_call_infos}")
+
+    @agent.on("function_calls_finished")
+    def function_calls_finished(fnc_call_infos: list[llm.FunctionCallInfo]):
+        print(f"function_calls_finished: {fnc_call_infos}")
+
+    @agent.on("metrics_collected")
+    def metrics_collected(metrics: metrics.MultimodalLLMMetrics):
+        print(f"metrics_collected: {metrics}")
+
     agent.start(ctx.room, participant)
 
 

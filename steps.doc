@@ -1,27 +1,41 @@
 Local run
-
-Local Livekit Server
-Local SIP Server (?)
+prerequisite: 
+- Local Livekit Server => command for redis: livekit-server --dev --redis-host=localhost:6379
+- Local SIP Server =>?https://github.com/livekit/sip/#running-locally
 lk sip outbound create outbound-trunk.json --api-key=devkey --api-secret=secret
 Set ST_sip_id in env variable SIP_OUTBOUND_TRUNK_ID
 python3 agent.py dev => to agent locally
 
+lk dispatch create \
+  --new-room \
+  --agent-name outbound-caller \
+  --metadata '+14012252944' \
+  --api-key=devkey --api-secret=secret
+  
+
 
 Cloud run
-lk dispatch create \
+prerequisite: 
+  Agent env variables to set cloud api key, secret and url
+  Run lk sip outbound create outbound-trunk.json --api-key APIAAjQyPwbMa6v --api-secret kIfF3uGsGwZr7P4lIk7QPHcElUHeqafBhk7abYDHHRaA --url wss://outbound-poc-6amhti9g.livekit.cloud
+  To get ST_ sip id => put it in env variable SIP_OUTBOUND_TRUNK_ID
+  Run agent with `python3 agent.py start`
+
+  lk dispatch create \
   --new-room \
   --agent-name outbound-caller \
   --metadata '+14012252944' \
   --api-key APIAAjQyPwbMa6v --api-secret kIfF3uGsGwZr7P4lIk7QPHcElUHeqafBhk7abYDHHRaA --url wss://outbound-poc-6amhti9g.livekit.cloud
 
-  Agent env variables to set cloud api key, secret and url
-  Run lk sip outbound create outbound-trunk.json --api-key APIAAjQyPwbMa6v --api-secret kIfF3uGsGwZr7P4lIk7QPHcElUHeqafBhk7abYDHHRaA --url wss://outbound-poc-6amhti9g.livekit.cloud
-  To get ST_ sip id => put it in env variable SIP_OUTBOUND_TRUNK_ID
-  Run agent with `python3 agent.py start`
 
 
   Twilio:
   Create Twilio SIP Trunk , get URl of the trunk, use that in the `lk sip outbound create outbound-trunk.json`
   In trial you can only call the verified numbers (your number and registered numbers)
   https://www.twilio.com/docs/api/errors/32100
+
+
+  OpenAI Realtime agent
+  https://docs.livekit.io/agents/openai/customize/turn-detection/
+  https://platform.openai.com/docs/guides/realtime-model-capabilities
 
