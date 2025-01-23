@@ -188,7 +188,7 @@ async def entrypoint(ctx: JobContext):
     # start the agent, either a VoicePipelineAgent or MultimodalAgent
     # this can be started before the user picks up. The agent will only start
     # speaking once the user answers the call.
-    # run_voice_pipeline_agent(ctx, participant, instructions)
+    run_voice_pipeline_agent(ctx, participant, instructions)
     run_multimodal_agent(ctx, participant, instructions)
 
     # in addition, you can monitor the call status separately
@@ -334,11 +334,9 @@ def run_multimodal_agent(
         instructions=instructions,
         modalities=["audio", "text"],
     )
-    # chat_ctx = llm.ChatContext()
     agent = MultimodalAgent(
         model=model,
         fnc_ctx=CallActions(api=ctx.api, participant=participant, room=ctx.room, patient_info=USER_INFO),
-        # chat_ctx=chat_ctx,
     )
 
     @agent.on("user_started_speaking")

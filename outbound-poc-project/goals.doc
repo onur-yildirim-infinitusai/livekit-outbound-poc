@@ -1,0 +1,9 @@
+- Write basic prompt to tell that this is a call for HRA
+- Create tool to be called when we need to generate a response
+- OR create a before_llm_cb method to test which one is better
+- Write a tes to prove that it should always call the tool we wrote (Optional)
+- Add a method to save the transcript to a file
+- Create Action class and the Conversation class which is a linked list or tree of actions
+- Find a way to test all these in a unit test (Optional)
+
+Test with VoicePipelineAgent and/or MultimodalAgent

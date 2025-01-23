@@ -3,3 +3,4 @@ venv/
 .DS_Store
 .venv/
 outbound-trunk.json
+__pycache__/
