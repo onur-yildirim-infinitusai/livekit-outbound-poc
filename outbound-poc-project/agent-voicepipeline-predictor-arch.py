@@ -22,7 +22,8 @@ from livekit.agents.pipeline import VoicePipelineAgent
 from livekit.plugins import deepgram, openai, silero
 from colorama import Fore, Style
 from components.call_conversation import Action, initialize_conversation, initialize_conversation_with_action_tree
-
+from components.llm import InfinitusLLMStream, InfinitusDummyLLM
+from components.chat_log_manager import ChatLogManager
 # load environment variables, this is optional, only used for local development
 load_dotenv(dotenv_path=".env.local")
 logger = logging.getLogger("outbound-caller")
@@ -67,6 +68,7 @@ Outputs to extract: {outputs_to_extract}""" if "{outputs_to_extract}" else "")
 
 # state_tracker = initialize_conversation()
 state_tracker = initialize_conversation_with_action_tree()
+chat_log_manager = ChatLogManager()
 
 def get_prompt(prompt: str, action: Action, pushback_actions: list[Action], answer_actions: list[Action]):
     pushback_actions_str = "\n".join([f"{action.name}: {action.utterance} ({action.instructions})" for action in pushback_actions])
@@ -99,52 +101,82 @@ async def entrypoint(ctx: JobContext):
     # start the agent, either a VoicePipelineAgent or MultimodalAgent
     # this can be started before the user picks up. The agent will only start
     # speaking once the user answers the call.
-    # run_voice_pipeline_agent(ctx, participant, _default_instructions)
     current_action = state_tracker.get_current_action()
     pushback_actions = state_tracker.get_pushback_actions()
     answer_actions = state_tracker.get_answer_actions()
     system_prompt = get_prompt(SYSTEM_PROMPT, current_action, pushback_actions, answer_actions)
     print(system_prompt)
 
-    run_voice_pipeline_agent(ctx, participant, system_prompt)
+    await run_voice_pipeline_agent(ctx, participant, system_prompt)
+
+def before_tts_cb(
+        agent: VoicePipelineAgent,
+        text: str | AsyncIterable[str]   
+) -> str | AsyncIterable[str]:
+    if isinstance(text, str):
+        print(Fore.YELLOW + f"before_tts_cb (string): {text}" + Style.RESET_ALL)
+        return text
+    else:
+        # Collect all chunks into a single string
+        async def generate_full_sentence():
+            result = ""
+            async for chunk in text:
+                result += chunk
+            print(Fore.YELLOW + f"before_tts_cb (chunks): {result}" + Style.RESET_ALL)
+            yield result
+        return generate_full_sentence()
+    
+async def before_llm_cb(
+    agent: VoicePipelineAgent, chat_ctx: llm.ChatContext
+) -> llm.LLMStream:
+    print(Fore.YELLOW + "Custom before LLM callback invoked", chat_ctx.messages[-1], Style.RESET_ALL)
+    print(Fore.YELLOW + f"before_llm_cb: {chat_ctx}" + Style.RESET_ALL)
+    chat_log_manager.print_chat_log()
+    current_action = state_tracker.get_current_action()
+    current_action_utterance = current_action.utterance
+    current_action_outputs = current_action.outputs
+
+    if current_action_outputs:
+        for output in current_action_outputs:
+            state_tracker.get_outputs_bag().set_output(output, "yes")
+
+    next_action = state_tracker.next_action()
+    if next_action:
+        next_action_utterance = next_action.utterance
+        return InfinitusLLMStream(llm=agent.llm, chat_ctx=chat_ctx, value=next_action_utterance)
+
+    # NOTE: set add_to_chat_ctx=True will add the message to the end
+    #   of the chat context of the function call for answer synthesis
+    # speech_handle = agent.say(source="Give me one second!", add_to_chat_ctx=True)  # noqa: F841
+    
+    # return InfinitusLLMStream(llm=agent.llm, chat_ctx=chat_ctx, value="You have reached a callback! Please continue the conversation.You have reached a callback! Please continue the conversation.You have reached a callback! Please continue the conversation.")
+    return InfinitusLLMStream(llm=agent.llm, chat_ctx=chat_ctx, value=current_action_utterance)
 
 
-def run_voice_pipeline_agent(
+async def run_voice_pipeline_agent(
     ctx: JobContext, participant: rtc.RemoteParticipant, instructions: str
 ):
     print("starting voice pipeline agent")
 
-    def before_tts_cb(
-         agent: VoicePipelineAgent,
-         text: str | AsyncIterable[str]   
-    ) -> str | AsyncIterable[str]:
-        if isinstance(text, str):
-            print(Fore.YELLOW + f"before_tts_cb (string): {text}" + Style.RESET_ALL)
-            return text
-        else:
-            # Collect all chunks into a single string
-            async def generate_full_sentence():
-                result = ""
-                async for chunk in text:
-                    result += chunk
-                print(Fore.YELLOW + f"before_tts_cb (chunks): {result}" + Style.RESET_ALL)
-                yield result
-            return generate_full_sentence()
 
     initial_ctx = llm.ChatContext().append(
         role="system",
-        text=instructions,
+        text=instructions, # TODO: remove this
     )
 
     agent = VoicePipelineAgent(
         vad=ctx.proc.userdata["vad"],
         stt=deepgram.STT(model="nova-2-phonecall"),
-        llm=openai.LLM(tool_choice="auto"),
+        # llm=openai.LLM(),
+        llm=InfinitusDummyLLM(),
         tts=openai.TTS(),
         chat_ctx=initial_ctx,
-        fnc_ctx=CallActions(api=ctx.api, participant=participant, room=ctx.room),
+        # fnc_ctx=CallActions(api=ctx.api, participant=participant, room=ctx.room),
         before_tts_cb=before_tts_cb,
+        before_llm_cb=before_llm_cb,
     )
+
+    agent.start(ctx.room, participant)
 
     @agent.on("user_started_speaking")
     def user_started_speaking():
@@ -165,34 +197,52 @@ def run_voice_pipeline_agent(
     @agent.on("user_speech_committed")
     def user_speech_committed(msg: llm.ChatMessage):
         print(Fore.BLUE + f"user_speech_committed: {msg}" + Style.RESET_ALL)
-
+        chat_log_manager.add_message(msg.content, "USER")
     @agent.on("agent_speech_committed")
     def agent_speech_committed(msg: llm.ChatMessage):
         print(Fore.CYAN + f"agent_speech_committed: {msg}" + Style.RESET_ALL)
-
+        chat_log_manager.add_message(msg.content, "AGENT")
     @agent.on("agent_speech_interrupted")
-    def agent_speech_interrupted():
-        print(Fore.CYAN + "agent_speech_interrupted" + Style.RESET_ALL)
+    def agent_speech_interrupted(msg: llm.ChatMessage):
+        print(Fore.CYAN + f"agent_speech_interrupted: {msg}" + Style.RESET_ALL)
+        chat_log_manager.add_message(msg.content, "AGENT - INTERRUPTED")
 
-    @agent.on("function_calls_collected")
-    def function_calls_collected(fnc_call_infos: list[llm.FunctionCallInfo]):
-        print(Fore.YELLOW + "function_calls_collected" + Style.RESET_ALL)
-        for fnc_call_info in fnc_call_infos:
-            print(Fore.YELLOW + f"Function call info: {fnc_call_info}" + Style.RESET_ALL)
-            if fnc_call_info.function_info.name == "call_if_output_is_extracted":
-                print(f"Output extracted: {fnc_call_info}")
-            elif fnc_call_info.function_info.name == "call_if_output_is_not_extracted":
-                print(Fore.YELLOW + f"No output extracted: {fnc_call_info}" + Style.RESET_ALL)
+    # @agent.on("function_calls_collected")
+    # def function_calls_collected(fnc_call_infos: list[llm.FunctionCallInfo]):
+    #     print(Fore.YELLOW + "function_calls_collected" + Style.RESET_ALL)
+    #     for fnc_call_info in fnc_call_infos:
+    #         print(Fore.YELLOW + f"Function call info: {fnc_call_info}" + Style.RESET_ALL)
+    #         if fnc_call_info.function_info.name == "call_if_output_is_extracted":
+    #             print(f"Output extracted: {fnc_call_info}")
+    #         elif fnc_call_info.function_info.name == "call_if_output_is_not_extracted":
+    #             print(Fore.YELLOW + f"No output extracted: {fnc_call_info}" + Style.RESET_ALL)
 
-    @agent.on("function_calls_finished")
-    def function_calls_finished(fnc_call_infos: list[llm.FunctionCallInfo]):
-        print(Fore.LIGHTYELLOW_EX + f"function_calls_finished: {fnc_call_infos}" + Style.RESET_ALL)
+    # @agent.on("function_calls_finished")
+    # def function_calls_finished(fnc_call_infos: list[llm.FunctionCallInfo]):
+    #     print(Fore.LIGHTYELLOW_EX + f"function_calls_finished: {fnc_call_infos}" + Style.RESET_ALL)
+
+    usage_collector = metrics.UsageCollector()
 
     @agent.on("metrics_collected")
-    def metrics_collected(metrics: metrics.MultimodalLLMMetrics):
-        print(f"metrics_collected: {metrics}")
+    def _on_metrics_collected(mtrcs: metrics.AgentMetrics):
+        metrics.log_metrics(mtrcs)
+        usage_collector.collect(mtrcs)
 
-    agent.start(ctx.room, participant)
+    async def log_usage():
+        summary = usage_collector.get_summary()
+        logger.info(f"Usage: ${summary}")
+
+    write_task = asyncio.create_task(chat_log_manager.write_to_file())
+
+    async def finish_queue():
+        chat_log_manager.log_queue.put_nowait(None)
+        await write_task
+
+    ctx.add_shutdown_callback(log_usage)
+    ctx.add_shutdown_callback(finish_queue)
+
+    await agent.say("Hey, how can I help you today?", allow_interruptions=True)
+
 
 class CallActions(llm.FunctionContext):
     """
@@ -295,73 +345,6 @@ class CallActions(llm.FunctionContext):
             There is no output to extract for {new_action.name} so you can continue the conversation.
             Your new instructions are: \n{action_prompt}
             """ 
-
-
-def run_multimodal_agent(
-    ctx: JobContext, participant: rtc.RemoteParticipant, instructions: str
-):
-    print("starting multimodal agent")
-
-    # https://docs.livekit.io/agents/openai/customize/parameters/
-    model = openai.realtime.RealtimeModel(
-        instructions=instructions,
-        modalities=["audio", "text"],
-        # tool_choice="required",
-    )
-
-    agent = MultimodalAgent(
-        model=model,
-        fnc_ctx=CallActions(api=ctx.api, participant=participant, room=ctx.room),
-    )
-
-    @agent.on("user_started_speaking")
-    def user_started_speaking():
-        print(Fore.BLUE + "user_started_speaking" + Style.RESET_ALL)
-
-    @agent.on("user_stopped_speaking")
-    def user_stopped_speaking():
-        print(Fore.BLUE + "user_stopped_speaking" + Style.RESET_ALL)
-
-    @agent.on("agent_started_speaking")
-    def agent_started_speaking():
-        print(Fore.CYAN + "agent_started_speaking" + Style.RESET_ALL)
-
-    @agent.on("agent_stopped_speaking")
-    def agent_stopped_speaking():
-        print(Fore.CYAN + "agent_stopped_speaking" + Style.RESET_ALL)
-
-    @agent.on("user_speech_committed")
-    def user_speech_committed(msg: llm.ChatMessage):
-        print(Fore.BLUE + f"user_speech_committed: {msg}" + Style.RESET_ALL)
-
-    @agent.on("agent_speech_committed")
-    def agent_speech_committed(msg: llm.ChatMessage):
-        print(Fore.CYAN + f"agent_speech_committed: {msg}" + Style.RESET_ALL)
-
-    @agent.on("agent_speech_interrupted")
-    def agent_speech_interrupted():
-        print(Fore.CYAN + "agent_speech_interrupted" + Style.RESET_ALL)
-
-    @agent.on("function_calls_collected")
-    def function_calls_collected(fnc_call_infos: list[llm.FunctionCallInfo]):
-        print(Fore.YELLOW + "function_calls_collected" + Style.RESET_ALL)
-        for fnc_call_info in fnc_call_infos:
-            print(Fore.YELLOW + f"Function call info: {fnc_call_info}" + Style.RESET_ALL)
-            if fnc_call_info.function_info.name == "call_if_output_is_extracted":
-                print(f"Output extracted: {fnc_call_info}")
-            elif fnc_call_info.function_info.name == "call_if_output_is_not_extracted":
-                print(Fore.YELLOW + f"No output extracted: {fnc_call_info}" + Style.RESET_ALL)
-
-    @agent.on("function_calls_finished")
-    def function_calls_finished(fnc_call_infos: list[llm.FunctionCallInfo]):
-        print(Fore.LIGHTYELLOW_EX + f"function_calls_finished: {fnc_call_infos}" + Style.RESET_ALL)
-
-    @agent.on("metrics_collected")
-    def metrics_collected(metrics: metrics.MultimodalLLMMetrics):
-        print(f"metrics_collected: {metrics}")
-
-    agent.start(ctx.room, participant)
-
 
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
