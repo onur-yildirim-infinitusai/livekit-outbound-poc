@@ -5,3 +5,4 @@ venv/
 outbound-trunk.json
 __pycache__/
 transcriptions.log
+*.doc
